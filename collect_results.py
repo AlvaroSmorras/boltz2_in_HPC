@@ -1,42 +1,31 @@
 #!/usr/bin/env python3
-"""Collect Boltz-2 affinity results and key them back to CompoundIndex.
+"""Collect Boltz-2 affinity results, keyed by CompoundIndex.
 
-Each compound produces  affinity_<stem>.json  where <stem> is the YAML filename
-stem set by make_yamls.py. This script finds those JSONs, recovers the exact
-CompoundIndex via index_map.parquet, and emits a table ready to merge into your
-Parquet.
+Each compound produces  affinity_<CompoundIndex>.json  (the YAML was named after its
+CompoundIndex, so Boltz stamps it into the filename). The CompoundIndex is read
+straight from each filename.
 
-File discovery
---------------
-By default it looks for affinity_*.json directly inside --indir (a FLAT folder),
-which matches a workflow that extracts just the affinity JSONs and deletes the
-rest of each prediction directory. Use --recursive for the original nested
-out/.../predictions/<stem>/ layout.
+Values are reported EXACTLY as Boltz writes them -- no conversions, no derived
+quantities. Columns keep Boltz's own field names:
+  affinity_pred_value            Boltz's primary affinity prediction (lower = stronger)
+  affinity_probability_binary    Boltz's binder probability, 0..1
+  affinity_pred_value1, 2, ...   individual ensemble-member values (when present)
+  affinity_probability_binary1, 2, ...  member binder probabilities (when present)
+  n_members                      how many numbered members the JSON contained
 
-Affinity fields (per the Boltz source)
---------------------------------------
-  affinity_pred_value          log10(IC50), IC50 in uM; LOWER = stronger. PRIMARY
-                               (the combined/ensemble prediction) -> used to rank.
-  affinity_probability_binary  P(binder), 0..1. PRIMARY.
-  affinity_pred_value1/2 ...   individual ensemble-member values (0+ of them).
-  affinity_probability_binary1/2 ...  member binder probabilities.
-We keep each member as its own column and add the member mean/std (agreement
-signal). Conversions (IC50_uM, pIC50, dG_proxy) are computed from the PRIMARY
-value, falling back to the member mean if the primary key is absent.
+File discovery: affinity_*.json directly inside --indir (flat folder) by default;
+use --recursive for a nested layout.
 
 Usage:
-  python collect_results.py \
-      --indir affinity_jsons --map inputs/index_map.parquet \
-      --output affinity_results.parquet \
-      [--merge-into compounds.parquet] [--recursive]
+  python collect_results.py --indir affinity_jsons --output affinity_results.parquet \
+      [--merge-into compounds.parquet] [--id-col CompoundIndex] [--recursive]
 
 --output format is auto-detected from the extension: .parquet/.pq, .csv, .tsv.
 """
-import argparse, json, re, statistics
+import argparse, json, re
 from pathlib import Path
 
-_V = re.compile(r"affinity_pred_value(\d+)$")
-_P = re.compile(r"affinity_probability_binary(\d+)$")
+_NUMBERED = re.compile(r"affinity_(pred_value|probability_binary)(\d+)$")
 
 
 def write_table(df, path):
@@ -55,40 +44,18 @@ def write_table(df, path):
     return p
 
 
-def conversions(y):
-    if y is None:
-        return (None, None, None)
-    return (10.0 ** y, 6.0 - y, (6.0 - y) * 1.364)   # IC50_uM, pIC50, dG_proxy
-
-
 def parse_one(d):
-    """Return a flat dict of fields for one affinity JSON (any #members)."""
-    base_v = d.get("affinity_pred_value")
-    base_p = d.get("affinity_probability_binary")
-    members_v = {int(m.group(1)): v for k, v in d.items() if (m := _V.match(k))}
-    members_p = {int(m.group(1)): v for k, v in d.items() if (m := _P.match(k))}
-
-    # primary value: prefer the combined field; else the mean of members
-    y = base_v
-    if y is None and members_v:
-        y = statistics.mean(members_v.values())
-    ic50, pic50, dg = conversions(y)
-
+    """Pull Boltz's affinity fields out of one JSON, unmodified."""
     row = {
-        "binder_probability": base_p if base_p is not None
-        else (statistics.mean(members_p.values()) if members_p else None),
-        "affinity_log10IC50uM": y,
-        "IC50_uM": ic50, "pIC50": pic50, "dG_proxy_kcal_per_mol": dg,
-        "n_members": len(members_v),
+        "affinity_pred_value": d.get("affinity_pred_value"),
+        "affinity_probability_binary": d.get("affinity_probability_binary"),
     }
-    for i in sorted(members_v):
-        row[f"affinity_value_{i}"] = members_v[i]
-    for i in sorted(members_p):
-        row[f"binder_prob_{i}"] = members_p[i]
-    if len(members_v) >= 2:
-        vals = list(members_v.values())
-        row["affinity_value_member_mean"] = statistics.mean(vals)
-        row["affinity_value_member_std"] = statistics.stdev(vals)
+    numbered = {k: v for k, v in d.items() if _NUMBERED.match(k)}
+    row["n_members"] = sum(1 for k in numbered if k.startswith("affinity_pred_value"))
+    # keep numbered members under their original Boltz names, in numeric order
+    for k in sorted(numbered, key=lambda k: (_NUMBERED.match(k).group(1),
+                                             int(_NUMBERED.match(k).group(2)))):
+        row[k] = numbered[k]
     return row
 
 
@@ -97,14 +64,15 @@ def main():
     ap.add_argument("--indir", "--outdir", dest="indir", default="out",
                     help="Folder with affinity_*.json (flat by default)")
     ap.add_argument("--recursive", action="store_true",
-                    help="Recurse into subdirectories (old nested layout)")
-    ap.add_argument("--map", default="inputs/index_map.parquet")
+                    help="Recurse into subdirectories (nested layout)")
     ap.add_argument("--output", default="affinity_results.parquet",
                     help="Results file; format auto-detected from extension "
                          "(.parquet/.pq, .csv, .tsv)")
     ap.add_argument("--merge-into", default=None,
-                    help="Original compounds parquet; also writes "
-                         "<name>_with_affinity.parquet joined on CompoundIndex")
+                    help="Original compounds table; also writes "
+                         "<name>_with_affinity.<ext> joined on the id column")
+    ap.add_argument("--id-col", default="CompoundIndex",
+                    help="Name of the id column in --merge-into to join on")
     args = ap.parse_args()
 
     import pandas as pd
@@ -115,44 +83,46 @@ def main():
 
     recs = []
     for af in files:
-        stem = af.name[len("affinity_"):-len(".json")]
+        cid = af.name[len("affinity_"):-len(".json")]   # CompoundIndex from filename
         try:
             d = json.loads(af.read_text())
         except Exception as e:
             print(f"skip {af}: {e}")
             continue
-        row = {"yaml_stem": stem}
+        row = {"CompoundIndex": cid}
         row.update(parse_one(d))
         recs.append(row)
     if not recs:
         where = "recursively under" if args.recursive else "directly in"
         raise SystemExit(f"No affinity_*.json found {where} {indir}/")
-    res = pd.DataFrame(recs)
 
-    amap = pd.read_parquet(args.map)            # CompoundIndex, yaml_stem, chunk, smiles
-    merged = amap.merge(res, on="yaml_stem", how="left")
-
-    missing = int(merged["affinity_log10IC50uM"].isna().sum())
-    if missing:
-        print(f"NOTE: {missing}/{len(merged)} compounds have no affinity result "
-              f"(crashed or not finished).")
-
-    merged = merged.sort_values("affinity_log10IC50uM", na_position="last")
+    merged = pd.DataFrame(recs).sort_values("affinity_pred_value", na_position="last")
     out_path = write_table(merged, args.output)
-    nmem = int(res["n_members"].max()) if "n_members" in res else 0
+    nmem = int(merged["n_members"].max())
     print(f"Wrote {len(merged)} rows ({nmem} ensemble member(s) per compound) "
           f"-> {out_path}")
 
     if args.merge_into:
-        orig = pd.read_parquet(args.merge_into).copy()
-        metric_cols = [c for c in merged.columns
-                       if c not in ("CompoundIndex", "yaml_stem", "chunk", "smiles")]
-        right = merged[["CompoundIndex"] + metric_cols].copy()
-        # string-normalised join key -> dtype-proof
-        right["__k"] = right["CompoundIndex"].astype(str)
-        orig["__k"] = orig["CompoundIndex"].astype(str)
+        suf = Path(args.merge_into).suffix.lower()
+        if suf in (".parquet", ".pq"):
+            orig = pd.read_parquet(args.merge_into)
+        elif suf == ".tsv":
+            orig = pd.read_csv(args.merge_into, sep="\t")
+        else:
+            orig = pd.read_csv(args.merge_into)
+        orig = orig.copy()
+        if args.id_col not in orig.columns:
+            raise SystemExit(f"--merge-into has no '{args.id_col}' column. "
+                             f"Found: {list(orig.columns)} (set --id-col).")
+        right = merged.copy()
+        right["__k"] = right["CompoundIndex"].astype(str)   # dtype-proof join key
+        orig["__k"] = orig[args.id_col].astype(str)
         aug = orig.merge(right.drop(columns="CompoundIndex"), on="__k", how="left")
         aug = aug.drop(columns="__k")
+        missing = int(aug["affinity_pred_value"].isna().sum())
+        if missing:
+            print(f"NOTE: {missing}/{len(aug)} compounds in {args.merge_into} "
+                  f"have no affinity result (crashed or not finished).")
         dst = Path(args.merge_into)
         dst = dst.with_name(dst.stem + "_with_affinity" + dst.suffix)
         write_table(aug, dst)
